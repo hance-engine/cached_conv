@@ -84,16 +84,19 @@ class CachedPadding1d(nn.Module):
         b, c, _ = x.shape
         self.register_buffer(
             "pad",
-            torch.zeros(MAX_BATCH_SIZE, c, self.padding).to(x))
+            torch.zeros(MAX_BATCH_SIZE, c, self.padding).to(x))  # (b c pad_size)
         self.initialized += 1
 
     def forward(self, x):
+        """
+        x: (b c t)
+        """
         if not self.initialized:
             self.init_cache(x)
 
         if self.padding:
-            x = torch.cat([self.pad[:x.shape[0]], x], -1)
-            self.pad[:x.shape[0]].copy_(x[..., -self.padding:])
+            x = torch.cat([self.pad[:x.shape[0]], x], dim=-1)  # (b, c, pad_size+t)
+            self.pad[:x.shape[0]].copy_(x[..., -self.padding:])  # (b, c, pad_size)
 
             if self.crop:
                 x = x[..., :-self.padding]
@@ -128,8 +131,10 @@ class CachedConv1d(nn.Conv1d):
 
         self.cumulative_delay = (r_pad + stride_delay + cd) // s
 
-        self.cache = CachedPadding1d(padding)
         self.downsampling_delay = CachedPadding1d(stride_delay, crop=True)
+        self.cache = CachedPadding1d(padding)
+
+        self._pad = padding
 
     def forward(self, x):
         x = self.downsampling_delay(x)
@@ -217,6 +222,8 @@ class Conv1d(nn.Conv1d):
         self.cumulative_delay = 0
 
     def forward(self, x):
+        if isinstance(self._pad, int):
+            self._pad = (self._pad, self._pad)
         x = nn.functional.pad(x, self._pad)
         return nn.functional.conv1d(
             x,

@@ -5,7 +5,7 @@ import torch
 from .convs import MAX_BATCH_SIZE
 from .convs import AlignBranches as _AlignBranches
 from .convs import (Branches, CachedConv1d, CachedConvTranspose1d,
-                    CachedPadding1d, CachedSequential)
+                    CachedPadding1d, CachedSequential, Sequential)
 from .convs import Conv1d as _Conv1d
 from .convs import ConvTranspose1d as _ConvTranspose1d
 from .convs import get_padding
