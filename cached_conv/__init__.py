@@ -2,14 +2,34 @@ from warnings import warn
 
 import torch
 
-from .convs1d import MAX_BATCH_SIZE
-from .convs1d import AlignBranches as _AlignBranches
-from .convs1d import (Branches, CachedConv1d, CachedConvTranspose1d,
-                    CachedPadding1d, CachedSequential, Sequential)
+# from .convs1d import AlignBranches as _AlignBranches1d
+# from .convs1d import (BranchesCachedConv2d1d, CachedConvTranspose1d,
+#                     CachedPadding1d, CachedSequential, Sequential)
+
+# 1d
+from .convs1d import AlignBranches as _AlignBranches1d
+from .convs1d import Branches as _Branches1d
+from .convs1d import CachedConv1d
+from .convs1d import CachedConvTranspose1d
+from .convs1d import CachedPadding1d
+from .convs1d import CachedSequential
+from .convs1d import Sequential
+
 from .convs1d import Conv1d as _Conv1d
 from .convs1d import ConvTranspose1d as _ConvTranspose1d
-from .convs1d import get_padding
 
+# 2d
+from .convs2d import AlignBranches2d as _AlignBranches2d
+from .convs2d import Branches2d as _Branches2d
+from .convs2d import CachedConv2d
+from .convs2d import CachedConvTranspose2d
+from .convs2d import CachedPadding2d
+
+from .convs2d import Conv2d as _Conv2d
+from .convs2d import ConvTranspose2d as _ConvTranspose2d
+
+
+# GLOBAL VARIABLES
 USE_BUFFER_CONV = False
 
 
@@ -39,6 +59,11 @@ def Conv1d(*args, **kwargs):
     else:
         return _Conv1d(*args, **kwargs)
 
+def Conv2d(*args, **kwargs):
+    if USE_BUFFER_CONV:
+        return CachedConv2d(*args, **kwargs)
+    else:
+        return _Conv2d(*args, **kwargs)
 
 def ConvTranspose1d(*args, **kwargs):
     if USE_BUFFER_CONV:
@@ -46,12 +71,18 @@ def ConvTranspose1d(*args, **kwargs):
     else:
         return _ConvTranspose1d(*args, **kwargs)
 
-
-def AlignBranches(*args, **kwargs):
+def ConvTranspose2d(*args, **kwargs):
     if USE_BUFFER_CONV:
-        return _AlignBranches(*args, **kwargs)
+        return CachedConvTranspose2d(*args, **kwargs)
     else:
-        return Branches(*args, **kwargs)
+        return _ConvTranspose2d(*args, **kwargs)
+
+
+def AlignBranches1d(*args, **kwargs):
+    if USE_BUFFER_CONV:
+        return _AlignBranches1d(*args, **kwargs)
+    else:
+        return _Branches1d(*args, **kwargs)
 
 
 def test_equal(model_constructor, input_tensor, crop=True):
