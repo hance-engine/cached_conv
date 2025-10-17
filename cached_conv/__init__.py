@@ -2,13 +2,13 @@ from warnings import warn
 
 import torch
 
-from .convs import MAX_BATCH_SIZE
-from .convs import AlignBranches as _AlignBranches
-from .convs import (Branches, CachedConv1d, CachedConvTranspose1d,
+from .convs1d import MAX_BATCH_SIZE
+from .convs1d import AlignBranches as _AlignBranches
+from .convs1d import (Branches, CachedConv1d, CachedConvTranspose1d,
                     CachedPadding1d, CachedSequential, Sequential)
-from .convs import Conv1d as _Conv1d
-from .convs import ConvTranspose1d as _ConvTranspose1d
-from .convs import get_padding
+from .convs1d import Conv1d as _Conv1d
+from .convs1d import ConvTranspose1d as _ConvTranspose1d
+from .convs1d import get_padding
 
 USE_BUFFER_CONV = False
 
