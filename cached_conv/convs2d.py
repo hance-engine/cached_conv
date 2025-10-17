@@ -1,375 +1,478 @@
+"""
+CausalConv2dCached that caches only along the width (last) dimension while keeping standard (non-causal, no cache) behavior along height. 
+Like the 1D version, it guarantees that each forward over a new width chunk returns the outputs for that chunk only, matching offline causal results.
+
+Tips
+- Width stride must be 1 for streaming. Height stride/padding/dilation are free.
+- Use get_state() / set_state() to checkpoint the width cache across segments or devices.
+- Set detach_cache_grad=False only if you explicitly need gradients to flow across width chunks during training.
+"""
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-
-MAX_BATCH_SIZE = 64
-
-# ---- Helpers ----
-
-def _normalize_2d_padding(padding):
+class CausalConv2dCached(nn.Module):
     """
-    Returns per-side pads as:
-      ((pad_top, pad_bottom), (pad_left, pad_right))
+    Causal Conv2d with streaming cache *only along width*.
+    Height dimension is handled by vanilla convolution (no caching, non-causal).
 
-    Accepted forms:
-      - int: p -> ((p,p),(p,p))
-      - (ph, pw): symmetric per-dim
-      - ((pt, pb), (pl, pr)): per-side
-      - (pl, pr, pt, pb): flat per-side in F.pad order
+    Args:
+      in_channels, out_channels: as usual
+      kernel_size: int or (kh, kw)
+      dilation: int or (dh, dw)
+      stride_h: vertical stride (height). Horizontal (width) stride is fixed to 1 for streaming.
+      padding_h: vertical padding (height). Width padding is handled manually for causality.
+      groups, bias: as in nn.Conv2d
+
+    Shapes:
+      x: (B, C_in, H, W_chunk)
+      out: (B, C_out, H_out, W_chunk)   # width is preserved; height depends on kh/stride_h/padding_h/dilation_h
+
+    Notes:
+      - Causality & cache are applied only along width.
+      - Width stride is fixed to 1. Height stride is configurable.
+      - Cache length = (kw - 1) * dw
     """
-    if isinstance(padding, int):
-        return (padding, padding), (padding, padding)
-
-    if isinstance(padding, (tuple, list)):
-        if len(padding) == 2 and all(isinstance(v, int) for v in padding):
-            ph, pw = padding
-            return (ph, ph), (pw, pw)
-
-        if len(padding) == 2 and all(isinstance(v, (tuple, list)) and len(v) == 2 for v in padding):
-            (pt, pb), (pl, pr) = padding
-            return (int(pt), int(pb)), (int(pl), int(pr))
-
-        if len(padding) == 4 and all(isinstance(v, int) for v in padding):
-            pl, pr, pt, pb = padding  # F.pad order
-            return (pt, pb), (pl, pr)
-
-    raise ValueError(f"Unsupported 2D padding format: {padding}")
-
-
-def _fpad_tuple(htb, wlr):
-    """
-    Convert ((top,bottom),(left,right)) -> (left,right,top,bottom) for F.pad
-    """
-    (pt, pb), (pl, pr) = htb, wlr
-    return (int(pl), int(pr), int(pt), int(pb))
-
-
-# ---- Cached sequential (width-only delay accounting) ----
-
-class CachedSequential2d(nn.Sequential):
-    """
-    Sequential wrapper that tracks cumulative delay along width.
-    """
-
-    def __init__(self, *args, **kwargs):
-        cumulative_delay = kwargs.pop("cumulative_delay", 0)
-        stride = kwargs.pop("stride", 1)
-        super().__init__(*args, **kwargs)
-
-        if isinstance(stride, (tuple, list)):
-            stride_w = int(stride[-1])
-        else:
-            stride_w = int(stride)
-
-        self.cumulative_delay = int(cumulative_delay) * stride_w
-
-        # Pick up last submodule's cumulative_delay, if present
-        last_delay = 0
-        for i in range(1, len(self) + 1):
-            try:
-                last_delay = int(self[-i].cumulative_delay)
-                break
-            except AttributeError:
-                pass
-        self.cumulative_delay += last_delay
-
-
-class Sequential2d(CachedSequential2d):
-    pass
-
-
-# ---- Cached padding (width only) ----
-
-class CachedPadding2d(nn.Module):
-    """
-    Cached padding along the *width* dimension.
-    Replaces left zero-padding with the trailing columns of the previous tensor.
-
-    Input/Output shapes: (B, C, H, W*)
-    """
-
-    def __init__(self, padding_w: int, crop: bool = False):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        dilation=1,
+        stride_h=1,
+        padding_h=0,
+        groups=1,
+        bias=True,
+    ):
         super().__init__()
-        self.initialized = 0
-        self.padding = int(padding_w)
-        self.crop = bool(crop)
 
-    @torch.jit.unused
-    @torch.no_grad()
-    def init_cache(self, x):
-        b, c, h, _ = x.shape
-        pad = torch.zeros(MAX_BATCH_SIZE, c, h, self.padding, dtype=x.dtype, device=x.device)
-        self.register_buffer("pad", pad)
-        self.initialized = 1
+        # Normalize tuples
+        if isinstance(kernel_size, int):
+            kh = kw = kernel_size
+        else:
+            kh, kw = kernel_size
+        if isinstance(dilation, int):
+            dh = dw = dilation
+        else:
+            dh, dw = dilation
 
-    @torch.no_grad()
-    def _maybe_reinit(self, x):
-        if not self.initialized:
-            self.init_cache(x)
-            return
-        # Re-init if channel/height/device/dtype changed
-        b, c, h, _ = x.shape
-        if (
-            self.pad.shape[1] != c
-            or self.pad.shape[2] != h
-            or self.pad.device != x.device
-            or self.pad.dtype != x.dtype
-        ):
-            self.init_cache(x)
+        if kw < 1 or kh < 1:
+            raise ValueError("kernel_size must be >= 1")
+        if dw < 1 or dh < 1:
+            raise ValueError("dilation must be >= 1")
+        if stride_h < 1:
+            raise ValueError("stride_h must be >= 1")
 
-    def forward(self, x):
-        """
-        x: (B, C, H, W)
-        """
-        if self.padding <= 0:
-            return x
+        self.kh, self.kw = int(kh), int(kw)
+        self.dh, self.dw = int(dh), int(dw)
+        self.stride_h = int(stride_h)
+        self.padding_h = int(padding_h)
+        self.groups = int(groups)
 
-        self._maybe_reinit(x)
+        # Cache only for width
+        self.cache_len = (self.kw - 1) * self.dw
 
-        b, _, h, _ = x.shape
-        # Ensure cached height matches current height (if H changed, reinit_cache already ran)
-        cached = self.pad[:b, :, :h]  # (b, c, h, pad_w)
-
-        # Prepend cached trailing columns along width
-        x = torch.cat([cached, x], dim=-1)  # (b, c, h, pad_w + W)
-
-        # Update cache with rightmost 'padding' columns of the extended input
-        cached.copy_(x[..., -self.padding:])  # (b, c, h, pad_w)
-
-        if self.crop:
-            x = x[..., :-self.padding]
-
-        return x
-
-
-# ---- Cached Conv2d (width-only streaming) ----
-
-class CachedConv2d(nn.Conv2d):
-    """
-    Conv2d with cached width padding. Height behaves like vanilla conv.
-
-    - Width: uses CachedPadding2d(left=total_w_pad) with future/stride compensation.
-    - Height: zero-padding (per-side) applied via F.pad before conv.
-    """
-
-    def __init__(self, *args, **kwargs):
-        padding_arg = kwargs.get("padding", 0)
-        cumulative_delay = int(kwargs.pop("cumulative_delay", 0))
-
-        # Disable internal padding; we handle both dims ourselves
-        kwargs["padding"] = 0
-        super().__init__(*args, **kwargs)
-
-        (pt, pb), (pl, pr) = _normalize_2d_padding(padding_arg)
-        total_w_pad = int(pl + pr)
-        r_pad_w = int(pr)
-
-        # Stride/dilation are tuples
-        stride_w = int(self.stride[-1])
-
-        # Align to stride (future compensation), along width only
-        stride_delay = (stride_w - ((r_pad_w + cumulative_delay) % stride_w)) % stride_w
-        self.cumulative_delay = (r_pad_w + stride_delay + cumulative_delay) // stride_w
-
-        self.downsampling_delay = CachedPadding2d(stride_delay, crop=True)
-        self.cache = CachedPadding2d(total_w_pad)
-
-        # Store height pads for F.pad
-        self._h_pad = (int(pt), int(pb))
-
-    def forward(self, x):
-        # Width-only delays/caching
-        x = self.downsampling_delay(x)
-        x = self.cache(x)
-
-        # Height-only zero pad (no caching)
-        pt, pb = self._h_pad
-        if pt or pb:
-            x = F.pad(x, (0, 0, pt, pb))  # (left,right,top,bottom): width pads are 0 here
-
-        return F.conv2d(
-            x,
-            self.weight,
-            self.bias,
-            self.stride,
-            0,  # padding already handled
-            self.dilation,
-            self.groups,
+        # Conv2d with:
+        #  - height padding handled by Conv2d (padding_h)
+        #  - width padding handled manually (0 here)
+        #  - width stride fixed to 1
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=(self.kh, self.kw),
+            stride=(self.stride_h, 1),
+            padding=(self.padding_h, 0),
+            dilation=(self.dh, self.dw),
+            groups=self.groups,
+            bias=bias,
         )
 
+        # Internal width cache: (B, C_in, H, cache_len). Created lazily.
+        self.register_buffer("_cache", None, persistent=False)
 
-# ---- Cached ConvTranspose2d (width-only streaming) ----
+    # ---------------- Cache helpers ----------------
+    def clear_cache(self):
+        self._cache = None
 
-class CachedConvTranspose2d(nn.ConvTranspose2d):
-    """
-    ConvTranspose2d with cached overlap-add along width only.
-    Height uses vanilla transposed-conv padding; width is handled manually.
-    """
+    def has_cache(self):
+        return (self._cache is not None) and (self.cache_len > 0)
 
-    def __init__(self, *args, **kwargs):
-        cd = int(kwargs.pop("cumulative_delay", 0))
-        super().__init__(*args, **kwargs)
-
-        self.initialized = 0
-        # cumulative delay measured along width
-        stride_w = int(self.stride[-1])
-        pad_h, pad_w = int(self.padding[0]), int(self.padding[1])
-        self.cumulative_delay = pad_w + cd * stride_w
-
-    @torch.jit.unused
-    @torch.no_grad()
-    def init_cache(self, x):
-        # x is post-conv_transpose2d output (B, C_out, H, W)
-        b, c, h, _ = x.shape
-        pad_w = 2 * int(self.padding[1])
-        cache = torch.zeros(MAX_BATCH_SIZE, c, h, pad_w, dtype=x.dtype, device=x.device)
-        self.register_buffer("cache", cache)
-        self.initialized = 1
-
-    @torch.no_grad()
-    def _maybe_reinit(self, x):
-        if not self.initialized:
-            self.init_cache(x)
+    def _ensure_cache(self, x):
+        if self.cache_len == 0:
+            self._cache = None
             return
-        b, c, h, _ = x.shape
-        if (
-            self.cache.shape[1] != c
-            or self.cache.shape[2] != h
-            or self.cache.device != x.device
-            or self.cache.dtype != x.dtype
-        ):
-            self.init_cache(x)
-
-    def forward(self, x):
-        # Keep height padding vanilla (self.padding[0]); width padding handled manually
-        pad_h = int(self.padding[0])
-
-        y = F.conv_transpose2d(
-            x,
-            self.weight,
-            None,  # defer bias
-            self.stride,
-            (pad_h, 0),  # height pad as usual, width pad disabled (0)
-            self.output_padding,
-            self.groups,
-            self.dilation,
+        B, C, H, _ = x.shape
+        need_new = (
+            self._cache is None
+            or self._cache.size(0) != B
+            or self._cache.size(1) != C
+            or self._cache.size(2) != H
+            or self._cache.device != x.device
+            or self._cache.dtype != x.dtype
         )
+        if need_new:
+            self._cache = x.new_zeros(B, C, H, self.cache_len)
 
-        width_overlap = 2 * int(self.padding[1])
-        if width_overlap > 0:
-            self._maybe_reinit(y)
-            b, _, h, _ = y.shape
+    def get_state(self):
+        return None if self._cache is None else self._cache.detach().clone()
 
-            # Overlap-add using cached tail from previous chunk
-            y[..., :width_overlap] += self.cache[:b, :, :h]
-            # Update cache with current rightmost overlap slice
-            self.cache[:b, :, :h].copy_(y[..., -width_overlap:])
-            # Crop the trailing overlap from the output
-            y = y[..., :-width_overlap]
+    def set_state(self, state):
+        if state is None:
+            self._cache = None
+        else:
+            if state.dim() != 4 or state.size(-1) != self.cache_len:
+                raise ValueError(f"state must have shape (B, C_in, H, {self.cache_len})")
+            self._cache = state.clone()
 
-        # Add bias if present
-        if self.bias is not None:
-            y = y + self.bias.view(1, -1, 1, 1)
+    @torch.no_grad()
+    def _update_cache(self, cache, x):
+        if self.cache_len == 0:
+            return None
+        W = x.size(-1)
+        if cache is None:
+            if W >= self.cache_len:
+                return x[..., -self.cache_len:]
+            pad = x.new_zeros(x.size(0), x.size(1), x.size(2), self.cache_len - W)
+            return torch.cat([pad, x], dim=-1)
+
+        if W >= self.cache_len:
+            return x[..., -self.cache_len:]
+        return torch.cat([cache[..., W:], x], dim=-1)
+
+    # ---------------- Forward ----------------
+    def forward(self, x, *, use_cache=True, reset_cache=False, detach_cache_grad=True):
+        """
+        x: (B, C_in, H, W_chunk)
+        Returns outputs for this chunk only (width preserved).
+        """
+        if reset_cache:
+            self.clear_cache()
+
+        B, C, H, W = x.shape
+
+        if use_cache:
+            self._ensure_cache(x)
+            if self.cache_len > 0 and self._cache is not None:
+                padded = torch.cat([self._cache, x], dim=-1)
+            elif self.cache_len > 0:
+                padded = torch.cat([x.new_zeros(B, C, H, self.cache_len), x], dim=-1)
+            else:
+                padded = x
+        else:
+            if self.cache_len > 0:
+                padded = torch.cat([x.new_zeros(B, C, H, self.cache_len), x], dim=-1)
+            else:
+                padded = x
+
+        y = self.conv(padded)  # -> (B, C_out, H_out, W)
+
+        if use_cache and self.cache_len > 0:
+            new_cache = self._update_cache(self._cache, x)
+            self._cache = new_cache.detach() if detach_cache_grad else new_cache
+
         return y
 
+    @torch.no_grad()
+    def forward_full(self, x):
+        """
+        Offline causal width-only conv: zero-left-pad width by cache_len; height vanilla.
+        Does not touch internal cache.
+        """
+        B, C, H, W = x.shape
+        if self.cache_len > 0:
+            padded = torch.cat([x.new_zeros(B, C, H, self.cache_len), x], dim=-1)
+        else:
+            padded = x
+        return self.conv(padded)
 
-# ---- Vanilla wrappers (no caching; keep interface parity) ----
 
-class ConvTranspose2d(nn.ConvTranspose2d):
-    def __init__(self, *args, **kwargs) -> None:
-        kwargs.pop("cumulative_delay", 0)
-        super().__init__(*args, **kwargs)
-        self.cumulative_delay = 0
+# --------------------------
+# Minimal streaming example
+# --------------------------
+if __name__ == "__main__":
+    torch.manual_seed(0)
 
+    B, C_in, C_out = 2, 3, 4
+    H, W_total = 6, 73
 
-class Conv2d(nn.Conv2d):
+    kh, kw = 3, 5
+    dh, dw = 1, 2          # dilation along width = 2  -> cache_len = (5-1)*2 = 8
+    stride_h = 2           # vanilla vertical stride
+    padding_h = 1          # keep height roughly "same" for kh=3, stride_h=2
+
+    x = torch.randn(B, C_in, H, W_total)
+
+    layer = CausalConv2dCached(
+        C_in, C_out,
+        kernel_size=(kh, kw),
+        dilation=(dh, dw),
+        stride_h=stride_h,
+        padding_h=padding_h,
+        bias=True,
+    )
+    layer.eval()
+
+    # Offline ground truth (width-causal, height-vanilla)
+    y_offline = layer.forward_full(x)
+
+    # Stream over arbitrary width chunks (height is full each time)
+    chunk_sizes = [7, 4, 13, 1, 9, 16, 8, 15]  # sums to 73
+    assert sum(chunk_sizes) == W_total
+
+    layer.clear_cache()
+    outs = []
+    start = 0
+    for n in chunk_sizes:
+        chunk = x[:, :, :, start:start+n]         # (B, C_in, H, n)
+        y_chunk = layer(chunk, use_cache=True)    # (B, C_out, H_out, n)
+        outs.append(y_chunk)
+        start += n
+
+    y_stream = torch.cat(outs, dim=-1)
+
+    max_abs_err = (y_offline - y_stream).abs().max().item()
+    print(f"Max absolute error (stream vs offline): {max_abs_err:.6g}")
+    assert torch.allclose(y_offline, y_stream, atol=1e-6), "Streaming != offline!"
+
+    # Optional: strict single-column streaming
+    layer.clear_cache()
+    outs_cols = []
+    for t in range(W_total):
+        y_t = layer(x[:, :, :, t:t+1], use_cache=True)   # (B, C_out, H_out, 1)
+        outs_cols.append(y_t)
+    y_cols = torch.cat(outs_cols, dim=-1)
+    print(f"Per-column equals offline: {torch.allclose(y_cols, y_offline, atol=1e-6)}")
+import torch
+import torch.nn as nn
+
+class CausalConv2dCached(nn.Module):
     """
-    Conv2d that supports per-side padding via F.pad.
-    """
-    def __init__(self, *args, **kwargs):
-        padding_arg = kwargs.get("padding", 0)
-        kwargs.pop("cumulative_delay", 0)
-        # Disable internal padding; apply explicit F.pad for full per-side control
-        kwargs["padding"] = 0
-        super().__init__(*args, **kwargs)
-        (pt, pb), (pl, pr) = _normalize_2d_padding(padding_arg)
-        # F.pad expects (left,right,top,bottom)
-        self._pad = (int(pl), int(pr), int(pt), int(pb))
-        self.cumulative_delay = 0
+    Causal Conv2d with streaming cache *only along width*.
+    Height dimension is handled by vanilla convolution (no caching, non-causal).
 
-    def forward(self, x):
-        pl, pr, pt, pb = self._pad
-        if pl or pr or pt or pb:
-            x = F.pad(x, self._pad)
-        return F.conv2d(
-            x,
-            self.weight,
-            self.bias,
-            self.stride,
-            0,
-            self.dilation,
-            self.groups,
+    Args:
+      in_channels, out_channels: as usual
+      kernel_size: int or (kh, kw)
+      dilation: int or (dh, dw)
+      stride_h: vertical stride (height). Horizontal (width) stride is fixed to 1 for streaming.
+      padding_h: vertical padding (height). Width padding is handled manually for causality.
+      groups, bias: as in nn.Conv2d
+
+    Shapes:
+      x: (B, C_in, H, W_chunk)
+      out: (B, C_out, H_out, W_chunk)   # width is preserved; height depends on kh/stride_h/padding_h/dilation_h
+
+    Notes:
+      - Causality & cache are applied only along width.
+      - Width stride is fixed to 1. Height stride is configurable.
+      - Cache length = (kw - 1) * dw
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        dilation=1,
+        stride_h=1,
+        padding_h=0,
+        groups=1,
+        bias=True,
+    ):
+        super().__init__()
+
+        # Normalize tuples
+        if isinstance(kernel_size, int):
+            kh = kw = kernel_size
+        else:
+            kh, kw = kernel_size
+        if isinstance(dilation, int):
+            dh = dw = dilation
+        else:
+            dh, dw = dilation
+
+        if kw < 1 or kh < 1:
+            raise ValueError("kernel_size must be >= 1")
+        if dw < 1 or dh < 1:
+            raise ValueError("dilation must be >= 1")
+        if stride_h < 1:
+            raise ValueError("stride_h must be >= 1")
+
+        self.kh, self.kw = int(kh), int(kw)
+        self.dh, self.dw = int(dh), int(dw)
+        self.stride_h = int(stride_h)
+        self.padding_h = int(padding_h)
+        self.groups = int(groups)
+
+        # Cache only for width
+        self.cache_len = (self.kw - 1) * self.dw
+
+        # Conv2d with:
+        #  - height padding handled by Conv2d (padding_h)
+        #  - width padding handled manually (0 here)
+        #  - width stride fixed to 1
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=(self.kh, self.kw),
+            stride=(self.stride_h, 1),
+            padding=(self.padding_h, 0),
+            dilation=(self.dh, self.dw),
+            groups=self.groups,
+            bias=bias,
         )
 
+        # Internal width cache: (B, C_in, H, cache_len). Created lazily.
+        self.register_buffer("_cache", None, persistent=False)
 
-# ---- Branch utilities (width-delay alignment across branches) ----
+    # ---------------- Cache helpers ----------------
+    def clear_cache(self):
+        self._cache = None
 
-class AlignBranches2d(nn.Module):
-    """
-    Align branches by compensating for different cumulative width-delays.
-    Applies CachedPadding2d (crop=True) on the input for each branch.
-    Height is unchanged.
-    """
+    def has_cache(self):
+        return (self._cache is not None) and (self.cache_len > 0)
 
-    def __init__(self, *branches, delays=None, cumulative_delay=0, stride=1):
-        super().__init__()
-        self.branches = nn.ModuleList(branches)
+    def _ensure_cache(self, x):
+        if self.cache_len == 0:
+            self._cache = None
+            return
+        B, C, H, _ = x.shape
+        need_new = (
+            self._cache is None
+            or self._cache.size(0) != B
+            or self._cache.size(1) != C
+            or self._cache.size(2) != H
+            or self._cache.device != x.device
+            or self._cache.dtype != x.dtype
+        )
+        if need_new:
+            self._cache = x.new_zeros(B, C, H, self.cache_len)
 
-        if delays is None:
-            delays = [getattr(b, "cumulative_delay", 0) for b in self.branches]
+    def get_state(self):
+        return None if self._cache is None else self._cache.detach().clone()
 
-        max_delay = int(max(delays))
-
-        self.paddings = nn.ModuleList([
-            CachedPadding2d(int(max_delay - d), crop=True) for d in delays
-        ])
-
-        if isinstance(stride, (tuple, list)):
-            stride_w = int(stride[-1])
+    def set_state(self, state):
+        if state is None:
+            self._cache = None
         else:
-            stride_w = int(stride)
+            if state.dim() != 4 or state.size(-1) != self.cache_len:
+                raise ValueError(f"state must have shape (B, C_in, H, {self.cache_len})")
+            self._cache = state.clone()
 
-        self.cumulative_delay = int(cumulative_delay) * stride_w + max_delay
+    @torch.no_grad()
+    def _update_cache(self, cache, x):
+        if self.cache_len == 0:
+            return None
+        W = x.size(-1)
+        if cache is None:
+            if W >= self.cache_len:
+                return x[..., -self.cache_len:]
+            pad = x.new_zeros(x.size(0), x.size(1), x.size(2), self.cache_len - W)
+            return torch.cat([pad, x], dim=-1)
 
-    def forward(self, x):
-        outs = []
-        for branch, pad in zip(self.branches, self.paddings):
-            delayed_x = pad(x)
-            outs.append(branch(delayed_x))
-        return outs
+        if W >= self.cache_len:
+            return x[..., -self.cache_len:]
+        return torch.cat([cache[..., W:], x], dim=-1)
 
+    # ---------------- Forward ----------------
+    def forward(self, x, *, use_cache=True, reset_cache=False, detach_cache_grad=True):
+        """
+        x: (B, C_in, H, W_chunk)
+        Returns outputs for this chunk only (width preserved).
+        """
+        if reset_cache:
+            self.clear_cache()
 
-class Branches2d(nn.Module):
-    """
-    Run multiple branches without alignment; track cumulative width-delay = max(branch delays).
-    """
+        B, C, H, W = x.shape
 
-    def __init__(self, *branches, delays=None, cumulative_delay=0, stride=1):
-        super().__init__()
-        self.branches = nn.ModuleList(branches)
-
-        if delays is None:
-            delays = [getattr(b, "cumulative_delay", 0) for b in self.branches]
-
-        max_delay = int(max(delays))
-
-        if isinstance(stride, (tuple, list)):
-            stride_w = int(stride[-1])
+        if use_cache:
+            self._ensure_cache(x)
+            if self.cache_len > 0 and self._cache is not None:
+                padded = torch.cat([self._cache, x], dim=-1)
+            elif self.cache_len > 0:
+                padded = torch.cat([x.new_zeros(B, C, H, self.cache_len), x], dim=-1)
+            else:
+                padded = x
         else:
-            stride_w = int(stride)
+            if self.cache_len > 0:
+                padded = torch.cat([x.new_zeros(B, C, H, self.cache_len), x], dim=-1)
+            else:
+                padded = x
 
-        self.cumulative_delay = int(cumulative_delay) * stride_w + max_delay
+        y = self.conv(padded)  # -> (B, C_out, H_out, W)
 
-    def forward(self, x):
-        return [branch(x) for branch in self.branches]
+        if use_cache and self.cache_len > 0:
+            new_cache = self._update_cache(self._cache, x)
+            self._cache = new_cache.detach() if detach_cache_grad else new_cache
+
+        return y
+
+    @torch.no_grad()
+    def forward_full(self, x):
+        """
+        Offline causal width-only conv: zero-left-pad width by cache_len; height vanilla.
+        Does not touch internal cache.
+        """
+        B, C, H, W = x.shape
+        if self.cache_len > 0:
+            padded = torch.cat([x.new_zeros(B, C, H, self.cache_len), x], dim=-1)
+        else:
+            padded = x
+        return self.conv(padded)
+
+
+# --------------------------
+# Minimal streaming example
+# --------------------------
+if __name__ == "__main__":
+    torch.manual_seed(0)
+
+    B, C_in, C_out = 2, 3, 4
+    H, W_total = 6, 73
+
+    kh, kw = 3, 5
+    dh, dw = 1, 2          # dilation along width = 2  -> cache_len = (5-1)*2 = 8
+    stride_h = 2           # vanilla vertical stride
+    padding_h = 1          # keep height roughly "same" for kh=3, stride_h=2
+
+    x = torch.randn(B, C_in, H, W_total)
+
+    layer = CausalConv2dCached(
+        C_in, C_out,
+        kernel_size=(kh, kw),
+        dilation=(dh, dw),
+        stride_h=stride_h,
+        padding_h=padding_h,
+        bias=True,
+    )
+    layer.eval()
+
+    # Offline ground truth (width-causal, height-vanilla)
+    y_offline = layer.forward_full(x)
+
+    # Stream over arbitrary width chunks (height is full each time)
+    chunk_sizes = [7, 4, 13, 1, 9, 16, 8, 15]  # sums to 73
+    assert sum(chunk_sizes) == W_total
+
+    layer.clear_cache()
+    outs = []
+    start = 0
+    for n in chunk_sizes:
+        chunk = x[:, :, :, start:start+n]         # (B, C_in, H, n)
+        y_chunk = layer(chunk, use_cache=True)    # (B, C_out, H_out, n)
+        outs.append(y_chunk)
+        start += n
+
+    y_stream = torch.cat(outs, dim=-1)
+
+    max_abs_err = (y_offline - y_stream).abs().max().item()
+    print(f"Max absolute error (stream vs offline): {max_abs_err:.6g}")
+    assert torch.allclose(y_offline, y_stream, atol=1e-6), "Streaming != offline!"
+
+    # Optional: strict single-column streaming
+    layer.clear_cache()
+    outs_cols = []
+    for t in range(W_total):
+        y_t = layer(x[:, :, :, t:t+1], use_cache=True)   # (B, C_out, H_out, 1)
+        outs_cols.append(y_t)
+    y_cols = torch.cat(outs_cols, dim=-1)
+    print(f"Per-column equals offline: {torch.allclose(y_cols, y_offline, atol=1e-6)}")

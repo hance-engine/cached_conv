@@ -1,282 +1,214 @@
+"""
+A lightweight, stateful “cached causal conv1d” you can drop into a streaming pipeline. 
+It keeps the last (kernel_size-1) * dilation input samples per batch in an internal buffer, so each call only needs the new chunk.
+
+Notes
+- The internal cache is per-(batch, channel) and is reallocated automatically if batch size, dtype, or device changes.
+- `detach_cache_grad=True` (default) keeps streaming clean for inference and avoids cross-chunk graph growth. If you’re doing chunked training and need gradients to flow across chunk boundaries, pass `detach_cache_grad=False`.
+- If you need to checkpoint/resume a stream, use `get_state()` / `set_state()` to export/import the cache.
+- For typical streaming setups, keep `stride=1`. If you need strided streaming, you’ll usually pair this with decimation logic in your pipeline (not shown here).
+"""
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-MAX_BATCH_SIZE = 64
-
-
-def get_padding(kernel_size, stride=1, dilation=1, mode="centered"):
+class CausalConv1dCached(nn.Module):
     """
-    Computes 'same' padding given a kernel size, stride an dilation.
+    Causal Conv1d with an internal streaming cache.
 
-    Parameters
-    ----------
+    - stride is fixed to 1 (common for streaming).
+    - cache length = (kernel_size - 1) * dilation
+    - forward(x, use_cache=True) returns the outputs for the *new* chunk only.
+      The layer updates its internal cache so the next call can pick up where it left off.
 
-    kernel_size: int
-        kernel_size of the convolution
-
-    stride: int
-        stride of the convolution
-
-    dilation: int
-        dilation of the convolution
-
-    mode: str
-        either "centered", "causal" or "anticausal"
+    Shapes:
+      x: (B, C_in, T)
+      out: (B, C_out, T)
     """
-    if kernel_size == 1: return (0, 0)
-    p = (kernel_size - 1) * dilation + 1
-    half_p = p // 2
-    if mode == "centered":
-        p_right = p // 2
-        p_left = (p - 1) // 2
-    elif mode == "causal":
-        p_right = 0
-        p_left = p // 2 + (p - 1) // 2
-    elif mode == "anticausal":
-        p_right = p // 2 + (p - 1) // 2
-        p_left = 0
-    else:
-        raise Exception(f"Padding mode {mode} is not valid")
-    return (p_left, p_right)
-
-
-class CachedSequential(nn.Sequential):
-    """
-    Sequential operations with future compensation tracking
-    """
-
-    def __init__(self, *args, **kwargs):
-        cumulative_delay = kwargs.pop("cumulative_delay", 0)
-        stride = kwargs.pop("stride", 1)
-        super().__init__(*args, **kwargs)
-
-        self.cumulative_delay = int(cumulative_delay) * stride
-
-        last_delay = 0
-        for i in range(1, len(self) + 1):
-            try:
-                last_delay = self[-i].cumulative_delay
-                break
-            except AttributeError:
-                pass
-        self.cumulative_delay += last_delay
-
-
-class Sequential(CachedSequential):
-    pass
-
-
-class CachedPadding1d(nn.Module):
-    """
-    Cached Padding implementation, replace zero padding with the end of
-    the previous tensor.
-    """
-
-    def __init__(self, padding, crop=False):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, bias=True):
         super().__init__()
-        self.initialized = 0
-        self.padding = padding
-        self.crop = crop
+        if kernel_size < 1:
+            raise ValueError("kernel_size must be >= 1")
+        if dilation < 1:
+            raise ValueError("dilation must be >= 1")
 
-    @torch.jit.unused
+        self.kernel_size = int(kernel_size)
+        self.dilation = int(dilation)
+        self.cache_len = (self.kernel_size - 1) * self.dilation
+
+        # No padding here; we handle causal padding manually
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=self.kernel_size,
+            stride=1,
+            padding=0,
+            dilation=self.dilation,
+            bias=bias,
+        )
+
+        # Internal cache (B, C_in, cache_len). Lazily initialized per batch/device/dtype.
+        self.register_buffer("_cache", None, persistent=False)
+
+    # ---- Cache helpers ----
+    def clear_cache(self):
+        """Forget all past context."""
+        self._cache = None
+
+    def has_cache(self):
+        return (self._cache is not None) and (self.cache_len > 0)
+
+    def _ensure_cache(self, x):
+        """Allocate/resize cache to match (B, C_in, cache_len)."""
+        if self.cache_len == 0:
+            self._cache = None
+            return
+
+        B, C_in, _ = x.shape
+        needs_new = (
+            self._cache is None
+            or self._cache.size(0) != B
+            or self._cache.size(1) != C_in
+            or self._cache.device != x.device
+            or self._cache.dtype != x.dtype
+        )
+        if needs_new:
+            self._cache = x.new_zeros(B, C_in, self.cache_len)
+
+    def get_state(self):
+        """Return a detached copy of the current cache (or None)."""
+        return None if self._cache is None else self._cache.detach().clone()
+
+    def set_state(self, state):
+        """Set the cache from an external tensor (B, C_in, cache_len) or None."""
+        if state is None:
+            self._cache = None
+        else:
+            if state.dim() != 3 or state.size(-1) != self.cache_len:
+                raise ValueError(f"state must have shape (B, C_in, {self.cache_len})")
+            self._cache = state.clone()
+
+    # ---- Forward paths ----
     @torch.no_grad()
-    def init_cache(self, x):
-        b, c, _ = x.shape
-        self.register_buffer(
-            "pad",
-            torch.zeros(MAX_BATCH_SIZE, c, self.padding).to(x))  # (b c pad_size)
-        self.initialized += 1
+    def _update_cache(self, cache, x):
+        """Return the next cache given previous `cache` and new chunk `x`."""
+        if self.cache_len == 0:
+            return None
+        T = x.size(-1)  # temporal length of the input (i.e., input chunk)
+        if cache is None:
+            # Initial call: cache is just the last cache_len samples of left-padding(zeros)|x
+            if T >= self.cache_len:
+                return x[:, :, -self.cache_len:]
+            else:
+                pad = x.new_zeros(x.size(0), x.size(1), self.cache_len - T)
+                return torch.cat([pad, x], dim=-1)
 
-    def forward(self, x):
+        if T >= self.cache_len:
+            # New chunk fully replaces the cache
+            return x[:, :, -self.cache_len:]
+        else:
+            # Shift old cache and append new x
+            return torch.cat([cache[:, :, T:], x], dim=-1)
+
+    def forward(self, x, *, use_cache=True, reset_cache=False, detach_cache_grad=True):
         """
-        x: (b c t)
+        x: (B, C_in, T)
+        use_cache:
+          - True  => prepend internal cache (or zeros on first call) so output length == T
+          - False => do *offline* causal conv: left-pad zeros; cache is NOT updated.
+        reset_cache: if True, clear cache before using it (useful to begin a stream).
+        detach_cache_grad:
+          - True (default) detaches cache updates (no cross-chunk autograd)
+          - False allows gradients to flow through caches across calls
         """
-        if not self.initialized:
-            self.init_cache(x)
+        if reset_cache:
+            self.clear_cache()
 
-        if self.padding:
-            x = torch.cat([self.pad[:x.shape[0]], x], dim=-1)  # (b, c, pad_size+t)
-            self.pad[:x.shape[0]].copy_(x[..., -self.padding:])  # (b, c, pad_size)
+        B, C_in, T = x.shape
+        if use_cache:
+            self._ensure_cache(x)
+            if self.cache_len > 0 and self._cache is not None:
+                padded = torch.cat([self._cache, x], dim=-1)
+            elif self.cache_len > 0:
+                # first call: left pad with zeros
+                padded = torch.cat([x.new_zeros(B, C_in, self.cache_len), x], dim=-1)
+            else:
+                padded = x
+        else:
+            # Offline/one-shot causal: left pad zeros; do not touch the cache
+            if self.cache_len > 0:
+                padded = torch.cat([x.new_zeros(B, C_in, self.cache_len), x], dim=-1)
+            else:
+                padded = x
 
-            if self.crop:
-                x = x[..., :-self.padding]
+        y = self.conv(padded)  # => (B, C_out, T)
 
-        return x
+        # Update cache only when streaming
+        if use_cache and self.cache_len > 0:
+            new_cache = self._update_cache(self._cache, x)
+            # Optionally keep graphs across calls (e.g., chunked training)
+            self._cache = new_cache.detach() if detach_cache_grad else new_cache
 
+        return y
 
-class CachedConv1d(nn.Conv1d):
-    """
-    Implementation of a Conv1d operation with cached padding
-    """
-
-    def __init__(self, *args, **kwargs):
-        padding = kwargs.get("padding", 0)
-        cumulative_delay = kwargs.pop("cumulative_delay", 0)
-
-        kwargs["padding"] = 0
-
-        super().__init__(*args, **kwargs)
-
-        if isinstance(padding, int):
-            r_pad = padding
-            padding = 2 * padding
-        elif isinstance(padding, list) or isinstance(padding, tuple):
-            r_pad = padding[1]
-            padding = padding[0] + padding[1]
-
-        s = self.stride[0]
-        cd = cumulative_delay
-
-        stride_delay = (s - ((r_pad + cd) % s)) % s
-
-        self.cumulative_delay = (r_pad + stride_delay + cd) // s
-
-        self.downsampling_delay = CachedPadding1d(stride_delay, crop=True)
-        self.cache = CachedPadding1d(padding)
-
-        self._pad = padding
-
-    def forward(self, x):
-        x = self.downsampling_delay(x)
-        x = self.cache(x)
-        return nn.functional.conv1d(
-            x,
-            self.weight,
-            self.bias,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-        )
-
-
-class CachedConvTranspose1d(nn.ConvTranspose1d):
-    """
-    Implementation of a ConvTranspose1d operation with cached padding
-    """
-
-    def __init__(self, *args, **kwargs):
-        cd = kwargs.pop("cumulative_delay", 0)
-        super().__init__(*args, **kwargs)
-        stride = self.stride[0]
-        self.initialized = 0
-        self.cumulative_delay = self.padding[0] + cd * stride
-
-    @torch.jit.unused
     @torch.no_grad()
-    def init_cache(self, x):
-        b, c, _ = x.shape
-        self.register_buffer(
-            "cache",
-            torch.zeros(
-                MAX_BATCH_SIZE,
-                c,
-                2 * self.padding[0],
-            ).to(x))
-        self.initialized += 1
-
-    def forward(self, x):
-        x = nn.functional.conv_transpose1d(
-            x,
-            self.weight,
-            None,
-            self.stride,
-            0,
-            self.output_padding,
-            self.groups,
-            self.dilation,
-        )
-
-        if not self.initialized:
-            self.init_cache(x)
-
-        padding = 2 * self.padding[0]
-
-        x[..., :padding] += self.cache[:x.shape[0]]
-        self.cache[:x.shape[0]].copy_(x[..., -padding:])
-
-        x = x[..., :-padding]
-
-        bias = self.bias
-        if bias is not None:
-            x = x + bias.unsqueeze(-1)
-        return x
+    def forward_full(self, x):
+        """
+        Pure offline causal conv (zero-left-padded), without touching internal cache.
+        Useful for equivalence checks.
+        """
+        B, C, T = x.shape
+        if self.cache_len > 0:
+            padded = torch.cat([x.new_zeros(B, C, self.cache_len), x], dim=-1)
+        else:
+            padded = x
+        return self.conv(padded)
 
 
-class ConvTranspose1d(nn.ConvTranspose1d):
+# --------------------------
+# Minimal streaming example
+# --------------------------
+if __name__ == "__main__":
+    torch.manual_seed(0)
 
-    def __init__(self, *args, **kwargs) -> None:
-        kwargs.pop("cumulative_delay", 0)
-        super().__init__(*args, **kwargs)
-        self.cumulative_delay = 0
+    B, C_in, C_out = 2, 3, 4
+    K, D = 5, 2        # kernel_size=5, dilation=2  -> cache_len = (5-1)*2 = 8
+    T_total = 64
 
+    x = torch.randn(B, C_in, T_total)
 
-class Conv1d(nn.Conv1d):
+    layer = CausalConv1dCached(C_in, C_out, kernel_size=K, dilation=D, bias=True)
+    layer.eval()  # typical for streaming inference
 
-    def __init__(self, *args, **kwargs):
-        self._pad = kwargs.get("padding", (0, 0))
-        kwargs.pop("cumulative_delay", 0)
-        kwargs["padding"] = 0
+    # Offline "ground truth" (one shot, zero-left-padded)
+    y_offline = layer.forward_full(x)
 
-        super().__init__(*args, **kwargs)
-        self.cumulative_delay = 0
+    # Streaming over uneven chunks
+    chunk_sizes = [7, 5, 9, 1, 16, 8, 18]  # sums to 64
+    assert sum(chunk_sizes) == T_total
 
-    def forward(self, x):
-        if isinstance(self._pad, int):
-            self._pad = (self._pad, self._pad)
-        x = nn.functional.pad(x, self._pad)
-        return nn.functional.conv1d(
-            x,
-            self.weight,
-            self.bias,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-        )
+    layer.clear_cache()  # begin a fresh stream
+    outs = []
+    start = 0
+    for n in chunk_sizes:
+        chunk = x[:, :, start:start+n]            # (B, C_in, n)
+        y_chunk = layer(chunk, use_cache=True)    # (B, C_out, n)
+        outs.append(y_chunk)
+        start += n
 
+    y_stream = torch.cat(outs, dim=-1)
 
-class AlignBranches(nn.Module):
+    # Check equivalence
+    max_abs_err = (y_offline - y_stream).abs().max().item()
+    print(f"Max absolute error (stream vs offline): {max_abs_err:.6g}")
+    assert torch.allclose(y_offline, y_stream, atol=1e-6), "Streaming does not match offline!"
 
-    def __init__(self, *branches, delays=None, cumulative_delay=0, stride=1):
-        super().__init__()
-        self.branches = nn.ModuleList(branches)
-
-        if delays is None:
-            delays = list(map(lambda x: x.cumulative_delay, self.branches))
-
-        max_delay = max(delays)
-
-        self.paddings = nn.ModuleList([
-            CachedPadding1d(p, crop=True)
-            for p in map(lambda f: max_delay - f, delays)
-        ])
-
-        self.cumulative_delay = int(cumulative_delay * stride) + max_delay
-
-    def forward(self, x):
-        outs = []
-        for branch, pad in zip(self.branches, self.paddings):
-            delayed_x = pad(x)
-            outs.append(branch(delayed_x))
-        return outs
-
-
-class Branches(nn.Module):
-
-    def __init__(self, *branches, delays=None, cumulative_delay=0, stride=1):
-        super().__init__()
-        self.branches = nn.ModuleList(branches)
-
-        if delays is None:
-            delays = list(map(lambda x: x.cumulative_delay, self.branches))
-
-        max_delay = max(delays)
-
-        self.cumulative_delay = int(cumulative_delay * stride) + max_delay
-
-    def forward(self, x):
-        outs = []
-        for branch in self.branches:
-            outs.append(branch(x))
-        return outs
+    # Optional: single-step usage (T=1 per call)
+    layer.clear_cache()
+    outs_step = []
+    for t in range(T_total):
+        y_t = layer(x[:, :, t:t+1], use_cache=True)  # (B, C_out, 1)
+        outs_step.append(y_t)
+    y_step = torch.cat(outs_step, dim=-1)
+    print(f"Stepwise equals offline: {torch.allclose(y_step, y_offline, atol=1e-6)}")
